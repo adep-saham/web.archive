@@ -6,15 +6,40 @@ from urllib.parse import urlparse
 import streamlit as st
 from playwright.sync_api import sync_playwright
 
-# ===== Google Drive OAuth =====
+# ===== Google Drive via OAuth token in Secrets =====
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.auth.transport.requests import Request
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
-TOKEN_FILE = Path("token.json")
-DRIVE_FOLDER_ID = "1EbdyUhfW1e1vAHTHbTiir44TH0rzEjB_"
+
+def drive_service():
+    if "gdrive_token_json" not in st.secrets:
+        raise RuntimeError("gdrive_token_json belum ada di Streamlit Secrets.")
+
+    token_info = json.loads(st.secrets["gdrive_token_json"])
+    creds = Credentials.from_authorized_user_info(token_info, DRIVE_SCOPES)
+
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+
+    return build("drive", "v3", credentials=creds)
+
+def upload_pdf_to_drive(pdf_path: str, filename: str):
+    folder_id = st.secrets["gdrive_folder_id"]
+    service = drive_service()
+
+    media = MediaFileUpload(pdf_path, mimetype="application/pdf")
+    meta = {"name": filename, "parents": [folder_id]}
+
+    created = service.files().create(
+        body=meta,
+        media_body=media,
+        fields="webViewLink"
+    ).execute()
+
+    return created.get("webViewLink")
 
 
 # ================= CONFIG =================
@@ -26,49 +51,14 @@ st.set_page_config(layout="wide")
 st.title("📦 Daily Web Archive Manager")
 
 
-# ================= Drive Helper =================
-def drive_service():
-    if not TOKEN_FILE.exists():
-        st.error("token.json belum ada. Jalankan: python drive_auth.py")
-        st.stop()
-
-    creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), DRIVE_SCOPES)
-
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
-
-    return build("drive", "v3", credentials=creds)
-
-
-def upload_pdf_to_drive(pdf_path: str, filename: str):
-    service = drive_service()
-    media = MediaFileUpload(pdf_path, mimetype="application/pdf")
-
-    meta = {
-        "name": filename,
-        "parents": [DRIVE_FOLDER_ID],
-    }
-
-    file = service.files().create(
-        body=meta,
-        media_body=media,
-        fields="webViewLink"
-    ).execute()
-
-    return file.get("webViewLink")
-
-
 # ================= Helpers =================
 def domain_from_url(url: str) -> str:
     return urlparse(url).netloc.replace(":", "_")
-
 
 def load_targets():
     if TARGET_FILE.exists():
         return json.loads(TARGET_FILE.read_text())
     return []
-
 
 def save_targets(tgts):
     TARGET_FILE.write_text(json.dumps(tgts, indent=2))
