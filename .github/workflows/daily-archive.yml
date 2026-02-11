@@ -2,7 +2,7 @@ name: Daily Web Archive
 
 on:
   schedule:
-    - cron: '0 1 * * *'   # Jam 08:00 WIB (UTC+7)
+    - cron: '0 1 * * *'   # Jam 12:00 WIB (UTC+7)
   workflow_dispatch:
 
 jobs:
