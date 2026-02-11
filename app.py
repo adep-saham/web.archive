@@ -5,6 +5,9 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
+import subprocess
+subprocess.run(["playwright", "install"], check=False)
+
 
 TARGET_FILE = Path("targets.json")
 ARCHIVE_DIR = Path("archives")
