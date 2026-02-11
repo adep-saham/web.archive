@@ -1,39 +1,65 @@
 # app.py
 import streamlit as st
+import json
 from pathlib import Path
 
-st.set_page_config(page_title="Web Archive Dashboard", layout="wide")
-
+TARGET_FILE = Path("targets.json")
 ARCHIVE_DIR = Path("archives")
-ARCHIVE_DIR.mkdir(exist_ok=True)
 
-st.title("📦 Web Archive (Daily Snapshot)")
+st.set_page_config(layout="wide")
+st.title("📦 Daily Web Archive Manager")
 
-runs = sorted([p for p in ARCHIVE_DIR.iterdir() if p.is_dir()], reverse=True)
+# ---------- Load / Save targets ----------
+def load_targets():
+    if TARGET_FILE.exists():
+        return json.loads(TARGET_FILE.read_text())
+    return []
 
-if not runs:
-    st.info("Belum ada arsip. Jalankan archiver.py dulu.")
-    st.stop()
+def save_targets(tgts):
+    TARGET_FILE.write_text(json.dumps(tgts, indent=2))
 
-selected = st.selectbox("Pilih snapshot", [p.name for p in runs])
-folder = ARCHIVE_DIR / selected
+targets = load_targets()
 
-col1, col2 = st.columns([1, 1])
+# ---------- Input URL ----------
+st.subheader("➕ Tambah Website")
+new_url = st.text_input("Masukkan URL")
 
-with col1:
-    st.subheader("Screenshot")
-    png = folder / "screenshot.png"
-    if png.exists():
-        st.image(str(png), use_container_width=True)
+if st.button("Tambah"):
+    if new_url and new_url not in targets:
+        targets.append(new_url)
+        save_targets(targets)
+        st.success("URL ditambahkan")
+        st.rerun()
 
-with col2:
-    st.subheader("Download")
-    for fn in ["page.html", "page.pdf", "screenshot.png", "meta.txt"]:
-        f = folder / fn
-        if f.exists():
-            st.download_button(
-                label=f"Download {fn}",
-                data=f.read_bytes(),
-                file_name=f"{selected}_{fn}",
-                mime="application/octet-stream",
-            )
+# ---------- List URL ----------
+st.subheader("🌐 Daftar Target Archive")
+for url in targets:
+    col1, col2 = st.columns([8,1])
+    col1.write(url)
+    if col2.button("❌", key=url):
+        targets.remove(url)
+        save_targets(targets)
+        st.rerun()
+
+# ---------- Archive Viewer ----------
+st.subheader("🗂️ Arsip")
+
+if ARCHIVE_DIR.exists():
+    domains = sorted([d.name for d in ARCHIVE_DIR.iterdir() if d.is_dir()])
+    if domains:
+        domain = st.selectbox("Pilih Domain", domains)
+        runs = sorted([r.name for r in (ARCHIVE_DIR/domain).iterdir()], reverse=True)
+        run = st.selectbox("Pilih Tanggal Snapshot", runs)
+
+        folder = ARCHIVE_DIR/domain/run
+
+        st.image(str(folder/"screenshot.png"), use_container_width=True)
+
+        for fn in ["page.html", "page.pdf", "screenshot.png"]:
+            f = folder/fn
+            if f.exists():
+                st.download_button(
+                    f"Download {fn}",
+                    data=f.read_bytes(),
+                    file_name=f"{domain}_{run}_{fn}"
+                )
