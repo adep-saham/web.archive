@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse
 
+import requests
 from playwright.sync_api import sync_playwright
 
 from google.oauth2.credentials import Credentials
@@ -73,18 +74,31 @@ def goto_with_retry(page, url: str):
             raise last_err
 
 
-def apply_fast_mode(page):
+# =========================
+# Tokopedia fallback (requests)
+# =========================
+def archive_tokopedia_html(url: str, out_dir: Path) -> Path:
     """
-    Block resource berat supaya lebih cepat dan mengurangi timeout.
-    Cocok untuk Tokopedia (dan situs berat lainnya).
+    Tokopedia sering blok headless CI → pakai requests (HTML snapshot).
     """
-    def route_handler(route):
-        rtype = route.request.resource_type
-        if rtype in ("image", "media", "font"):
-            return route.abort()
-        return route.continue_()
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
 
-    page.route("**/*", route_handler)
+    resp = requests.get(url, headers=headers, timeout=60)
+    resp.raise_for_status()
+
+    html_file = out_dir / "page.html"
+    html_file.write_text(resp.text, encoding="utf-8")
+    return html_file
 
 
 # =========================
@@ -103,60 +117,47 @@ def main():
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
     service = drive_service()
 
-    with sync_playwright() as p:
-        # Args ini membantu mengurangi ERR_HTTP2_PROTOCOL_ERROR (sering di CI),
-        # dan stabil di GitHub Actions.
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-http2",
-                "--disable-quic",
-            ],
-        )
+    # Pisahkan target Tokopedia (requests) dan non-Tokopedia (playwright)
+    tokopedia_urls = [u for u in targets if is_tokopedia(u)]
+    normal_urls = [u for u in targets if not is_tokopedia(u)]
 
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 720},
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-            ignore_https_errors=True,
-        )
+    # --- 1) Jalankan yang normal via Playwright -> PDF
+    if normal_urls:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-http2",
+                    "--disable-quic",
+                ],
+            )
 
-        for url in targets:
-            ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            domain = domain_from_url(url)
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+                ignore_https_errors=True,
+            )
 
-            out_dir = ARCHIVE_DIR / domain / ts
-            out_dir.mkdir(parents=True, exist_ok=True)
+            for url in normal_urls:
+                ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                domain = domain_from_url(url)
 
-            print("Archiving:", url)
+                out_dir = ARCHIVE_DIR / domain / ts
+                out_dir.mkdir(parents=True, exist_ok=True)
 
-            # ✅ 1 URL = 1 page (kunci agar tidak saling “interrupt”)
-            page = context.new_page()
-            page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
-            page.set_default_timeout(NAV_TIMEOUT_MS)
+                print("Archiving:", url)
 
-            try:
-                if is_tokopedia(url):
-                    # Tokopedia: mode khusus (lebih stabil pakai screenshot)
-                    apply_fast_mode(page)
+                # ✅ 1 URL = 1 page
+                page = context.new_page()
+                page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+                page.set_default_timeout(NAV_TIMEOUT_MS)
 
-                    # Jangan tunggu domcontentloaded (sering tidak selesai di Tokopedia)
-                    page.goto(url, wait_until="commit", timeout=120_000)
-                    page.wait_for_timeout(8000)
-
-                    png_file = out_dir / "page.png"
-                    page.screenshot(path=str(png_file), full_page=True)
-
-                    out_name = f"{domain}_{ts}.png"
-                    upload_file(service, folder_id, str(png_file), out_name, "image/png")
-                    print("Uploaded:", out_name)
-
-                else:
-                    # Situs normal: PDF
+                try:
                     goto_with_retry(page, url)
 
                     pdf_file = out_dir / "page.pdf"
@@ -166,25 +167,43 @@ def main():
                     upload_file(service, folder_id, str(pdf_file), out_name, "application/pdf")
                     print("Uploaded:", out_name)
 
-            except Exception:
-                print("FAILED:", url)
-                traceback.print_exc()
-
-            finally:
-                try:
-                    page.close()
                 except Exception:
-                    pass
+                    print("FAILED:", url)
+                    traceback.print_exc()
 
-        try:
-            context.close()
-        except Exception:
-            pass
+                finally:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
 
+            try:
+                context.close()
+            except Exception:
+                pass
+
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    # --- 2) Jalankan Tokopedia via requests -> HTML
+    for url in tokopedia_urls:
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        domain = domain_from_url(url)
+
+        out_dir = ARCHIVE_DIR / domain / ts
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        print("Archiving:", url)
         try:
-            browser.close()
+            html_file = archive_tokopedia_html(url, out_dir)
+            out_name = f"{domain}_{ts}.html"
+            upload_file(service, folder_id, str(html_file), out_name, "text/html")
+            print("Uploaded:", out_name)
         except Exception:
-            pass
+            print("FAILED:", url)
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
