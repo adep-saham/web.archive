@@ -3,7 +3,7 @@ import json
 import traceback
 from pathlib import Path
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 
 import requests
 from playwright.sync_api import sync_playwright
@@ -22,9 +22,9 @@ TARGET_FILE = Path("targets.json")
 ARCHIVE_DIR = Path("archives")
 ARCHIVE_DIR.mkdir(exist_ok=True)
 
-NAV_TIMEOUT_MS = 180_000  # 3 menit
-POST_LOAD_WAIT_MS = 4000  # jeda setelah DOM ready
-RETRIES = 2               # retry untuk error intermittent
+NAV_TIMEOUT_MS = 180_000
+POST_LOAD_WAIT_MS = 4000
+RETRIES = 2
 
 
 # =========================
@@ -39,11 +39,6 @@ def is_tokopedia(url: str) -> bool:
 
 
 def drive_service():
-    """
-    Ambil creds dari env var:
-      - GDRIVE_TOKEN_JSON: string JSON hasil OAuth (authorized_user)
-      - GDRIVE_FOLDER_ID: folder tujuan upload
-    """
     token_info = json.loads(os.environ["GDRIVE_TOKEN_JSON"])
     creds = Credentials.from_authorized_user_info(token_info, DRIVE_SCOPES)
 
@@ -75,29 +70,26 @@ def goto_with_retry(page, url: str):
 
 
 # =========================
-# Tokopedia fallback (requests)
+# Tokopedia via Google WebCache
 # =========================
-def archive_tokopedia_html(url: str, out_dir: Path) -> Path:
+def archive_tokopedia_webcache(url: str, out_dir: Path) -> Path:
     """
-    Tokopedia sering blok headless CI → pakai requests (HTML snapshot).
+    Archive Tokopedia via Google WebCache snapshot
+    supaya tidak kena anti-bot CI.
     """
+    encoded_url = quote_plus(url)
+    cache_url = f"https://webcache.bullseye.net/search?q=cache:{encoded_url}"
+
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
+        "User-Agent": "Mozilla/5.0"
     }
 
-    resp = requests.get(url, headers=headers, timeout=60)
+    resp = requests.get(cache_url, headers=headers, timeout=60)
     resp.raise_for_status()
 
-    html_file = out_dir / "page.html"
+    html_file = out_dir / "tokopedia_webcache.html"
     html_file.write_text(resp.text, encoding="utf-8")
+
     return html_file
 
 
@@ -106,22 +98,23 @@ def archive_tokopedia_html(url: str, out_dir: Path) -> Path:
 # =========================
 def main():
     if not TARGET_FILE.exists():
-        print("targets.json tidak ditemukan. Tidak ada yang dijalankan.")
+        print("targets.json tidak ditemukan.")
         return
 
     targets = json.loads(TARGET_FILE.read_text(encoding="utf-8"))
     if not targets:
-        print("targets.json kosong. Tidak ada target.")
+        print("targets.json kosong.")
         return
 
     folder_id = os.environ["GDRIVE_FOLDER_ID"]
     service = drive_service()
 
-    # Pisahkan target Tokopedia (requests) dan non-Tokopedia (playwright)
     tokopedia_urls = [u for u in targets if is_tokopedia(u)]
     normal_urls = [u for u in targets if not is_tokopedia(u)]
 
-    # --- 1) Jalankan yang normal via Playwright -> PDF
+    # =========================
+    # NORMAL WEBSITE → PDF
+    # =========================
     if normal_urls:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -152,10 +145,8 @@ def main():
 
                 print("Archiving:", url)
 
-                # ✅ 1 URL = 1 page
                 page = context.new_page()
                 page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
-                page.set_default_timeout(NAV_TIMEOUT_MS)
 
                 try:
                     goto_with_retry(page, url)
@@ -165,6 +156,7 @@ def main():
 
                     out_name = f"{domain}_{ts}.pdf"
                     upload_file(service, folder_id, str(pdf_file), out_name, "application/pdf")
+
                     print("Uploaded:", out_name)
 
                 except Exception:
@@ -172,22 +164,14 @@ def main():
                     traceback.print_exc()
 
                 finally:
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
+                    page.close()
 
-            try:
-                context.close()
-            except Exception:
-                pass
+            context.close()
+            browser.close()
 
-            try:
-                browser.close()
-            except Exception:
-                pass
-
-    # --- 2) Jalankan Tokopedia via requests -> HTML
+    # =========================
+    # TOKOPEDIA → WEB CACHE
+    # =========================
     for url in tokopedia_urls:
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         domain = domain_from_url(url)
@@ -195,12 +179,16 @@ def main():
         out_dir = ARCHIVE_DIR / domain / ts
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        print("Archiving:", url)
+        print("Archiving (WebCache):", url)
+
         try:
-            html_file = archive_tokopedia_html(url, out_dir)
-            out_name = f"{domain}_{ts}.html"
+            html_file = archive_tokopedia_webcache(url, out_dir)
+
+            out_name = f"{domain}_{ts}_webcache.html"
             upload_file(service, folder_id, str(html_file), out_name, "text/html")
+
             print("Uploaded:", out_name)
+
         except Exception:
             print("FAILED:", url)
             traceback.print_exc()
